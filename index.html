@@ -1,0 +1,402 @@
+<!--
+  Bomb Dodge Descent – v15 (2025‑05‑04)
+  --------------------------------------
+  * Canvas plein écran (desktop & mobile).
+  * Terrain destructible néon, ciel étoilé.
+  * Bombes rectangles retardées (1 s → 5 s).
+  * Poussée, anti‑grimpette, mobile/PC controls.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>Bomb Dodge Descent</title>
+    <style>
+        :root { --neon:#00ff00; }
+        html,body{height:100%;margin:0;background:#000;font-family:monospace;overflow:hidden}
+        canvas{width:100vw;height:100vh;display:block;touch-action:none;background:#000}
+        #ui{position:fixed;top:8px;left:50%;transform:translateX(-50%);color:var(--neon);text-shadow:0 0 4px var(--neon);font-size:18px;pointer-events:none;user-select:none;z-index:5}
+        .overlay{position:fixed;inset:0;display:flex;flex-direction:column;justify-content:center;align-items:center;background:#000;color:var(--neon);gap:24px;text-align:center;z-index:10}
+        .btn{padding:12px 32px;font-size:20px;border:2px solid var(--neon);background:transparent;color:var(--neon);cursor:pointer}
+        .btn:hover{background:var(--neon);color:#000}
+    </style>
+</head>
+<body>
+<!-- UI -->
+<div id="menu" class="overlay">
+    <h1>Bomb Dodge Descent</h1>
+    <button id="startBtn" class="btn">START</button>
+    <p>Tap gauche/droite = rouler · 2 doigts = saut&nbsp;/&nbsp;PC : A/Q ← · E/D → · W/Space = jump</p>
+</div>
+
+<div id="gameover" class="overlay" style="display:none;">
+    <h2 id="finalScore"></h2>
+    <button id="restartBtn" class="btn">Relancer</button>
+</div>
+
+<canvas id="game"></canvas>
+<div id="ui" style="display:none">Score : 0</div>
+
+<script>
+    'use strict';
+
+    /* === Canvas & Resize =================================================== */
+    const canvas = document.getElementById('game');
+    const ctx     = canvas.getContext('2d');
+    let CW, CH;
+    function resize() {
+        canvas.width  = window.innerWidth;
+        canvas.height = window.innerHeight;
+        CW = canvas.width;
+        CH = canvas.height;
+    }
+    resize();
+    addEventListener('resize', resize);
+
+    /* === Constants ========================================================= */
+    const TERRAIN_COLOR = '#00ff00';
+    const STAR_COUNT    = 120;
+    const GROUND_RATIO  = 0.7;             // 70 % of first screen = ground
+
+    const P_R      = 18;
+    const P_ACC    = 0.45;
+    const P_FRIC   = 0.86;
+    const P_GRAV   = 0.65;
+    const P_JUMP   = -13;
+
+    const INIT_SPAWN = 1800;
+    const MIN_SPAWN  = 350;
+    const DECAY      = 0.996;
+
+    const BW_MIN  = 20;
+    const BW_MAX  = 60;
+    const B_GRAV  = 0.35;
+    const B_FRIC  = 0.9;
+
+    /* === DOM refs ========================================================== */
+    const menu = document.getElementById('menu');
+    const over = document.getElementById('gameover');
+    const ui   = document.getElementById('ui');
+
+    /* === Global state ====================================================== */
+    let terrainCanvas, tctx;
+    let stars        = [];
+    let player;
+    let bombs        = [];
+    let explosions   = [];
+    let cameraY      = 0;
+    let spawnInt, spawnT, lastT, state, animID;
+
+    /* --- Input ------------------------------------------------------------- */
+    const keys = new Set();
+    let tLeft = false, tRight = false, tJump = false;
+
+    addEventListener('keydown', e => keys.add(e.key.toLowerCase()));
+    addEventListener('keyup',   e => keys.delete(e.key.toLowerCase()));
+
+    ['touchstart','touchmove','touchend','touchcancel']
+        .forEach(evt => addEventListener(evt, e => {
+            tLeft = tRight = false;
+            for (const t of e.touches || []) {
+                if (t.clientX < innerWidth / 2) tLeft  = true;
+                else                            tRight = true;
+            }
+            tJump = tLeft && tRight;
+        }));
+
+    /* --- Helpers ----------------------------------------------------------- */
+    const rand   = (a,b) => Math.random() * (b - a) + a;
+    const clamp  = (v,min,max) => v < min ? min : v > max ? max : v;
+
+    function isSolid(x,y) {
+        if (!terrainCanvas) return false;
+        if (x < 0 || x >= terrainCanvas.width ||
+            y < 0 || y >= terrainCanvas.height) return false;
+        return tctx.getImageData(x|0, y|0, 1, 1).data[3] !== 0;
+    }
+
+    function carveCircle(x,y,r) {
+        tctx.save();
+        tctx.globalCompositeOperation = 'destination-out';
+        tctx.beginPath();
+        tctx.arc(x, y, r, 0, Math.PI * 2);
+        tctx.fill();
+        tctx.restore();
+    }
+
+    function extendTerrain(extra) {
+        const n    = document.createElement('canvas');
+        n.width    = CW;
+        n.height   = terrainCanvas.height + extra;
+        const nctx = n.getContext('2d');
+        nctx.drawImage(terrainCanvas, 0, 0);
+        nctx.fillStyle = TERRAIN_COLOR;
+        nctx.fillRect(0, terrainCanvas.height, n.width, extra);
+        terrainCanvas = n;
+        tctx          = nctx;
+    }
+
+    function circleRectColl(cx, cy, cr, rx, ry, rw, rh) {
+        const nx = clamp(cx, rx - rw / 2, rx + rw / 2);
+        const ny = clamp(cy, ry - rh / 2, ry + rh / 2);
+        const dx = cx - nx;
+        const dy = cy - ny;
+        return dx*dx + dy*dy < cr*cr;
+    }
+
+    /* === Entities ========================================================== */
+    class Player {
+        constructor () {
+            this.x   = CW / 2;
+            this.y   = CH * 0.5;
+            this.vx  = 0;
+            this.vy  = 0;
+            this.low = this.y;
+            this.onGround = false;
+        }
+        update (dt) {
+            /* Horizontal input */
+            const L = keys.has('a') || keys.has('q') || tLeft;
+            const R = keys.has('e') || keys.has('d') || tRight;
+            if (L) this.vx -= P_ACC;
+            if (R) this.vx += P_ACC;
+            if (!L && !R) this.vx *= P_FRIC;
+            if (Math.abs(this.vx) > 7) this.vx *= 0.95;
+
+            /* Jump */
+            if ((keys.has(' ') || keys.has('w') || tJump) && this.onGround) {
+                this.vy = P_JUMP;
+                this.onGround = false;
+                tJump = false;
+            }
+
+            /* Gravity */
+            this.vy += P_GRAV;
+            if (this.vy > 18) this.vy = 18;
+
+            /* Horizontal move + wall‑climb prevention */
+            let nx = this.x + this.vx;
+            nx = clamp(nx, P_R, CW - P_R);
+
+            const side = Math.sign(this.vx);
+            if (side) {
+                let blocked = false;
+                for (const sy of [this.y - P_R*0.5, this.y, this.y + P_R*0.5]) {
+                    if (isSolid(nx + side * P_R, sy)) { blocked = true; break; }
+                }
+                if (blocked) { nx = this.x; this.vx = 0; }
+            }
+            this.x = nx;
+
+            /* Vertical move + ground / ceiling check */
+            let ny = this.y + this.vy;
+            this.onGround = false;
+            if (this.vy > 0) {                // Falling
+                while (isSolid(this.x, ny + P_R)) { ny--; this.vy = 0; this.onGround = true; }
+            } else if (this.vy < 0) {         // Jumping
+                while (isSolid(this.x, ny - P_R)) { ny++; this.vy = 0; }
+            }
+            this.y = ny;
+            if (this.y > this.low) this.low = this.y;
+        }
+        draw () {
+            ctx.fillStyle = '#ff0000';
+            ctx.beginPath();
+            ctx.arc(this.x, this.y - cameraY, P_R, 0, Math.PI * 2);
+            ctx.fill();
+        }
+    }
+
+    class Bomb {
+        constructor () {
+            this.w = rand(BW_MIN, BW_MAX);
+            this.h = this.w * 0.6;
+            this.x = rand(this.w / 2, CW - this.w / 2);
+            this.y = cameraY - 80;
+            this.vx = 0;
+            this.vy = 0;
+            this.state = 'fall';
+            /* Fuse 1‑5 s depending on size */
+            this.baseFuse = 1000 + ((this.w - BW_MIN) / (BW_MAX - BW_MIN)) * 4000;
+            this.timer    = 0;
+        }
+        update (dt) {
+            /* If ground below disappears, fall again */
+            if (this.state === 'landed' && !isSolid(this.x, this.y + this.h / 2 + 1)) {
+                this.state = 'fall';
+                this.vy    = 0;
+            }
+
+            if (this.state === 'fall') {
+                this.vy += B_GRAV;
+                if (this.vy > 12) this.vy = 12;
+                this.y  += this.vy;
+                this.x  += this.vx;
+                this.vx *= B_FRIC;
+
+                /* Land */
+                if (isSolid(this.x, this.y + this.h / 2)) {
+                    while (isSolid(this.x, this.y + this.h / 2)) this.y--;
+                    this.state = 'landed';
+                    this.timer = this.baseFuse;
+                    this.vy    = 0;
+                }
+
+            } else if (this.state === 'landed') {
+                /* Push friction */
+                this.x  += this.vx;
+                this.vx *= B_FRIC;
+                this.x  = clamp(this.x, this.w / 2, CW - this.w / 2);
+
+                /* If slid into a hole, fall again */
+                if (!isSolid(this.x, this.y + this.h / 2 + 1)) this.state = 'fall';
+
+                /* Countdown */
+                this.timer -= dt;
+                if (this.timer <= 0) this.explode();
+            }
+        }
+        explode () {
+            if (this.state === 'exploded') return;
+            this.state = 'exploded';
+            const r = Math.max(this.w, this.h) * 2.2;
+            carveCircle(this.x, this.y, r);
+            explosions.push({ x: this.x, y: this.y, r, ttl: 400 });
+            if (Math.hypot(player.x - this.x, player.y - this.y) < r + P_R) endGame();
+        }
+        draw () {
+            if (this.state === 'exploded') return;
+            const y = this.y - cameraY;
+            ctx.fillStyle = '#888';
+            ctx.fillRect(this.x - this.w / 2, y - this.h / 2, this.w, this.h);
+            if (this.state === 'landed') {
+                ctx.fillStyle = '#fff';
+                ctx.font = '14px monospace';
+                ctx.textAlign = 'center';
+                ctx.fillText(Math.max(0, Math.ceil(this.timer / 1000)), this.x, y + 4);
+            }
+        }
+    }
+
+    /* === Game setup ======================================================== */
+    function initTerrain () {
+        terrainCanvas         = document.createElement('canvas');
+        terrainCanvas.width   = CW;
+        terrainCanvas.height  = 6000;
+        tctx                  = terrainCanvas.getContext('2d');
+        tctx.fillStyle        = TERRAIN_COLOR;
+        tctx.fillRect(0, CH * GROUND_RATIO, CW, terrainCanvas.height - CH * GROUND_RATIO);
+
+        /* Starfield */
+        stars = [];
+        for (let i = 0; i < STAR_COUNT; i++)
+            stars.push({ x: rand(0, CW), y: rand(-5000, CH * GROUND_RATIO) });
+    }
+
+    function start () {
+        initTerrain();
+        menu.style.display = 'none';
+        over.style.display = 'none';
+        ui.style.display   = 'block';
+
+        player      = new Player();
+        bombs       = [];
+        explosions  = [];
+        cameraY     = Math.max(0, player.y - CH * 0.5);
+        spawnInt    = INIT_SPAWN;
+        spawnT      = 0;
+        lastT       = performance.now();
+        state       = 'play';
+
+        cancelAnimationFrame(animID);
+        animID = requestAnimationFrame(loop);
+    }
+
+    function endGame () {
+        state = 'over';
+        ui.style.display = 'none';
+        over.style.display = 'flex';
+        document.getElementById('finalScore').innerText =
+            `Score : ${Math.floor(player.low)} px`;
+    }
+
+    /* === Main loop ========================================================= */
+    function loop (now) {
+        const dt = now - lastT;
+        lastT = now;
+        if (state !== 'play') return;
+
+        /* Spawn bombs */
+        spawnT += dt;
+        if (spawnT >= spawnInt) {
+            spawnT = 0;
+            spawnInt = Math.max(MIN_SPAWN, spawnInt * DECAY);
+            bombs.push(new Bomb());
+        }
+
+        /* Updates */
+        player.update(dt);
+        bombs.forEach(b => b.update(dt));
+
+        /* Player ↔ bomb pushing */
+        bombs.forEach(b => {
+            if (b.state !== 'exploded' &&
+                circleRectColl(player.x, player.y, P_R, b.x, b.y, b.w, b.h))
+            {
+                const d = Math.sign(b.x - player.x) || 1;
+                b.vx     += d * 1.2;
+                player.vx -= d * 0.6;
+            }
+        });
+
+        /* Clean lists */
+        bombs       = bombs.filter(b => b.state !== 'exploded');
+        explosions.forEach(e => e.ttl -= dt);
+        explosions   = explosions.filter(e => e.ttl > 0);
+
+        /* Camera follow */
+        cameraY = Math.max(0, player.y - CH * 0.5);
+        if (cameraY + CH > terrainCanvas.height - 1200) extendTerrain(2000);
+
+        /* === Rendering === */
+        ctx.clearRect(0, 0, CW, CH);
+
+        /* Sky */
+        ctx.fillStyle = '#000';
+        ctx.fillRect(0, 0, CW, CH);
+        ctx.fillStyle = '#fff';
+        for (const s of stars) {
+            const sy = s.y - cameraY;
+            if (sy >= 0 && sy < CH) ctx.fillRect(s.x, sy, 2, 2);
+        }
+
+        /* Terrain slice */
+        ctx.drawImage(terrainCanvas,
+            0, cameraY, CW, CH,
+            0, 0, CW, CH);
+
+        /* Explosions flash */
+        explosions.forEach(e => {
+            ctx.fillStyle = `rgba(255,200,0,${e.ttl / 400})`;
+            ctx.beginPath();
+            ctx.arc(e.x, e.y - cameraY, e.r, 0, Math.PI * 2);
+            ctx.fill();
+        });
+
+        /* Entities */
+        bombs.forEach(b => b.draw());
+        player.draw();
+
+        /* UI */
+        ui.innerText = `Score : ${Math.floor(player.low)}`;
+
+        animID = requestAnimationFrame(loop);
+    }
+
+    /* === Buttons =========================================================== */
+    document.getElementById('startBtn').onclick   = start;
+    document.getElementById('restartBtn').onclick = start;
+</script>
+</body>
+</html>
